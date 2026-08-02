@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,11 +20,10 @@ from .image import (
 from .report import add_event, new_report, save_report
 
 
-import os
-
-
 def bundled_root() -> Path:
     """
+    Return the directory containing bundled read-only application data.
+
     Source checkout:
         project root
 
@@ -36,9 +36,7 @@ def bundled_root() -> Path:
 
 
 def user_data_root() -> Path:
-    """
-    Persistent writable storage for reports and experiments.
-    """
+    """Return a persistent writable directory for reports and experiments."""
     if sys.platform == "win32":
         base = Path(
             os.environ.get(
@@ -66,7 +64,6 @@ DEFAULT_FIRMWARE = (
     / "bb8"
     / "working_donor_application.bin"
 )
-
 DEFAULT_REPORTS = USER_DATA_ROOT / "reports"
 DEFAULT_EXPERIMENTS = USER_DATA_ROOT / "experiments"
 
@@ -75,6 +72,14 @@ def ask_exact(prompt: str, expected: str) -> None:
     typed = input(f'{prompt}\nType exactly "{expected}" to continue: ').strip()
     if typed != expected:
         raise RuntimeError("Confirmation did not match. Cancelled safely.")
+
+
+def pause_before_menu() -> None:
+    """Keep an interactively launched console open until the user is ready."""
+    try:
+        input("\nPress Enter to return to the main menu...")
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 
 def print_safety() -> None:
@@ -93,7 +98,7 @@ Before recovery:
 def progress(sent: int, total: int, elapsed: float) -> None:
     if sent == total or sent % 1000 < 20:
         percent = sent * 100.0 / total
-        speed = sent / elapsed
+        speed = sent / elapsed if elapsed > 0 else 0.0
         log(f"Progress: {sent}/{total} bytes ({percent:.1f}%), {speed:.0f} B/s")
 
 
@@ -101,6 +106,7 @@ def summarize_devices(devices: list[Advertisement]) -> None:
     if not devices:
         print("No BB- devices detected.")
         return
+
     for device in sorted(devices, key=lambda item: item.name):
         rssi = "n/a" if device.rssi is None else str(device.rssi)
         print(f"  {device.name:<12} {device.address:<20} RSSI {rssi}")
@@ -108,21 +114,28 @@ def summarize_devices(devices: list[Advertisement]) -> None:
 
 async def post_recovery_scan(before: list[Advertisement]) -> dict:
     before_addresses = {device.address.upper() for device in before}
-    before_pairs = {(device.address.upper(), device.name.upper()) for device in before}
+    before_pairs = {
+        (device.address.upper(), device.name.upper())
+        for device in before
+    }
     observed: dict[str, Advertisement] = {}
 
     log("Waiting 6 seconds before post-reboot discovery...")
     await asyncio.sleep(6.0)
+
     for attempt in range(1, 4):
         log(f"Scanning for restored BB-8 (attempt {attempt}/3)...")
+
         for device in await visible_bb_devices(timeout=10.0):
             observed[device.address.upper()] = device
+
         if any(
             device.address.upper() not in before_addresses
             or (device.address.upper(), device.name.upper()) not in before_pairs
             for device in observed.values()
         ):
             break
+
         await asyncio.sleep(3.0)
 
     devices = list(observed.values())
@@ -132,6 +145,7 @@ async def post_recovery_scan(before: list[Advertisement]) -> dict:
         if device.address.upper() not in before_addresses
         or (device.address.upper(), device.name.upper()) not in before_pairs
     ]
+
     return {
         "all_bb_devices": [device.__dict__ for device in devices],
         "new_bb_devices": [device.__dict__ for device in new_devices],
@@ -147,23 +161,31 @@ async def run_recovery(
 ) -> int:
     donor = firmware_path.read_bytes()
     donor_validation = verify_pristine_donor(donor)
+
     report = new_report(mode, __version__)
     report["donor"] = donor_validation.to_dict()
     add_event(report, "donor_verified", sha256=donor_validation.sha256)
 
     image = donor
     experiment_id = None
+
     if mode == "experimental":
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         experiment_id = f"EXP-{timestamp}"
         seed = generate_identity_seed()
         image, manifest = build_experimental_image(donor, seed)
+
         experiments_dir.mkdir(parents=True, exist_ok=True)
         image_path = experiments_dir / f"{experiment_id}.bin"
         manifest_path = experiments_dir / f"{experiment_id}.json"
+
         image_path.write_bytes(image)
         manifest["experiment_id"] = experiment_id
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
         report["experiment"] = manifest
         add_event(
             report,
@@ -172,6 +194,7 @@ async def run_recovery(
             image_sha256=hashlib.sha256(image).hexdigest(),
             seed=seed.hex().upper(),
         )
+
         print(f"Experiment ID: {experiment_id}")
         print(f"Generated identity candidate: {seed.hex(' ').upper()}")
         print(f"Archived image: {image_path}")
@@ -179,7 +202,10 @@ async def run_recovery(
 
     log("Recording BB- devices visible before recovery...")
     before = await visible_bb_devices(timeout=6.0)
-    report["pre_recovery_bb_devices"] = [device.__dict__ for device in before]
+    report["pre_recovery_bb_devices"] = [
+        device.__dict__
+        for device in before
+    ]
 
     transfer = await transfer_image(image, ota_address, progress)
     report["transfer"] = transfer
@@ -191,57 +217,90 @@ async def run_recovery(
 
     if new_devices:
         detected = new_devices[0]
+
         print("\nRecovery transfer completed and a restored BB-8 was detected:")
         print(f"  Name:    {detected['name']}")
         print(f"  Address: {detected['address']}")
         print("\nOpen Sphero Edu, select BB-8, and connect to that name.")
         print("Allow the official firmware update to finish if prompted.")
+
         report["outcome"] = "restored_bb8_detected"
         report["detected_device"] = detected
         add_event(report, "restored_bb8_detected", **detected)
     else:
         print("\nThe image transfer completed, but no restored BB-8 was detected.")
+
         if mode == "experimental":
             print("\nAvailable next steps:")
             print("  1. Retry Experimental Recovery with a new identity candidate.")
-            print(f"  2. Run Stable Recovery to restore the verified {DONOR_NAME} image.")
+            print(
+                f"  2. Run Stable Recovery to restore the verified "
+                f"{DONOR_NAME} image."
+            )
         else:
             print("Wait briefly, scan again, then check Sphero Edu for BB-278B.")
+
         report["outcome"] = "transfer_complete_no_bb_detected"
         add_event(report, "no_restored_bb8_detected")
 
-    stem = experiment_id or f"stable-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    stem = (
+        experiment_id
+        or f"stable-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    )
     report_path = save_report(report, reports_dir, stem)
     print(f"\nSaved recovery report: {report_path}")
+
     return 0
 
 
 async def diagnose() -> int:
     print("Scanning for nearby devices for 15 seconds...")
     devices = await scan(15.0)
-    ota = [device for device in devices if device.name.upper() == "OTA UPDATE"]
-    bb = [device for device in devices if device.name.upper().startswith("BB-")]
+
+    ota = [
+        device
+        for device in devices
+        if device.name.upper() == "OTA UPDATE"
+    ]
+    bb = [
+        device
+        for device in devices
+        if device.name.upper().startswith("BB-")
+    ]
+
     print("\nOTA UPDATE devices:")
     summarize_devices(ota)
+
     print("\nNormal BB- devices:")
     summarize_devices(bb)
+
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sphero-revived")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--firmware", type=Path, default=DEFAULT_FIRMWARE)
     parser.add_argument("--ota-address", help="Optional OTA UPDATE BLE address")
     parser.add_argument("--reports-dir", type=Path, default=DEFAULT_REPORTS)
-    parser.add_argument("--experiments-dir", type=Path, default=DEFAULT_EXPERIMENTS)
+    parser.add_argument(
+        "--experiments-dir",
+        type=Path,
+        default=DEFAULT_EXPERIMENTS,
+    )
+
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("diagnose", help="read-only device scan")
     sub.add_parser("stable", help="verified donor recovery")
-    sub.add_parser("experimental", help="untested randomized identity recovery")
+    sub.add_parser(
+        "experimental",
+        help="untested randomized identity recovery",
+    )
+
     return parser
 
 
-def interactive_choice() -> str:
+def print_menu() -> None:
     print(
         f"""
 Sphero Revived {__version__}
@@ -253,33 +312,21 @@ Reviving the Fun, One Sphero at a Time.
 4. Exit
 """.strip()
     )
-    return input("\nChoose an option: ").strip()
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    command = args.command
-    if command is None:
-        choice = interactive_choice()
-        command = {"1": "diagnose", "2": "stable", "3": "experimental", "4": "exit"}.get(choice)
-        if command is None:
-            print("Invalid choice.")
-            return 2
-
-    if command == "exit":
-        return 0
-    if command == "diagnose":
-        return asyncio.run(diagnose())
-
+def run_recovery_command(command: str, args: argparse.Namespace) -> int:
     print_safety()
+
     if command == "stable":
         print(
-            f"\nStable Recovery uses the exact hardware-verified donor image and "
-            f"should restore the droid as {DONOR_NAME}."
+            f"\nStable Recovery uses the exact hardware-verified donor image "
+            f"and should restore the droid as {DONOR_NAME}."
         )
-        ask_exact("This is a real firmware-writing operation.", "RESTORE BB-8")
+        ask_exact(
+            "This is a real firmware-writing operation.",
+            "RESTORE BB-8",
+        )
+
     elif command == "experimental":
         print(
             """
@@ -298,22 +345,94 @@ experimental path has been tested on hardware.
             "I ACCEPT THE EXPERIMENTAL RISK",
         )
 
-    try:
-        return asyncio.run(
-            run_recovery(
-                command,
-                args.firmware,
-                args.ota_address,
-                args.reports_dir,
-                args.experiments_dir,
-            )
+    return asyncio.run(
+        run_recovery(
+            command,
+            args.firmware,
+            args.ota_address,
+            args.reports_dir,
+            args.experiments_dir,
         )
+    )
+
+
+def run_direct_command(command: str, args: argparse.Namespace) -> int:
+    """Run a command supplied on the command line and exit normally."""
+    try:
+        if command == "diagnose":
+            return asyncio.run(diagnose())
+
+        if command in {"stable", "experimental"}:
+            return run_recovery_command(command, args)
+
+        raise RuntimeError(f"Unknown command: {command}")
+
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 130
+
     except Exception as error:
         print(f"\nERROR: {type(error).__name__}: {error}")
         return 1
+
+
+def interactive_main(args: argparse.Namespace) -> int:
+    """
+    Keep the interactive application alive after each action.
+
+    This is especially important on Windows, where a console opened by
+    double-clicking the executable would otherwise close immediately after the
+    scan or recovery action finishes.
+    """
+    while True:
+        print()
+        print_menu()
+
+        try:
+            choice = input("\nChoose an option: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            return 0
+
+        command = {
+            "1": "diagnose",
+            "2": "stable",
+            "3": "experimental",
+            "4": "exit",
+        }.get(choice)
+
+        if command == "exit":
+            print("Goodbye.")
+            return 0
+
+        if command is None:
+            print("\nInvalid choice. Please select 1, 2, 3, or 4.")
+            pause_before_menu()
+            continue
+
+        try:
+            if command == "diagnose":
+                asyncio.run(diagnose())
+            else:
+                run_recovery_command(command, args)
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+
+        except Exception as error:
+            print(f"\nERROR: {type(error).__name__}: {error}")
+
+        pause_before_menu()
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command is not None:
+        return run_direct_command(args.command, args)
+
+    return interactive_main(args)
 
 
 if __name__ == "__main__":
