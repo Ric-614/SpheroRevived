@@ -2,7 +2,7 @@
 <tr>
 <td width="170" align="center">
 
-<img src="assets/logo.png" alt="Sphero Revived Logo" width="150">
+<img src="assets/icon-512.png" alt="Sphero Revived Logo" width="150">
 
 </td>
 
